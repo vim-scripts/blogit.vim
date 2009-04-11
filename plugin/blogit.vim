@@ -13,10 +13,10 @@
 " along with this program; if not, write to the Free Software
 " Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 "
-" Maintainer:	Romain Bignon
-" URL:		http://dev.peerfuse.org/wiki/blogit
-" Version:	1.0
-" Last Change:  2009 March 13
+" Maintainer:   Romain Bignon
+" URL:          http://symlink.me/wiki/blogit
+" Version:      1.0.1
+" Last Change:  2009 April 11
 "
 " Commands :
 " ":Blogit ls"
@@ -51,7 +51,7 @@ command! -nargs=+ Blogit exec('py blogit.command(<f-args>)')
 
 python <<EOF
 # -*- coding: utf-8 -*-
-import vim, xmlrpclib, sys, re
+import vim, xmlrpclib, sys, re, time, datetime
 from xmlrpclib import DateTime, Fault
 from types import MethodType
 
@@ -62,6 +62,8 @@ from types import MethodType
 blog_username = 'user'
 blog_password = 'passwd'
 blog_url = 'http://example.com/xmlrpc.php'
+# enabled if blog has the tag plugin:
+have_tags = True
 
 #####################
 # Do not edit below #
@@ -72,12 +74,19 @@ class BlogIt:
     def __init__(self):
         self.client = xmlrpclib.ServerProxy(blog_url)
         self.current_post = None
+        self.haveTags = have_tags
 
     def command(self, command, *args):
         commands = self.getMethods('command_')
         if not command in commands:
             sys.stderr.write("No such command: %s" % command)
-        commands[command](*args)
+        try:
+            commands[command](*args)
+        except TypeError, e:
+            try:
+                sys.stderr.write("Command %s takes %s arguments" % (command, int(str(e).split(' ')[3]) - 1))
+            except:
+                sys.stderr.write('%s' % e)
 
     def command_help(self):
         sys.stdout.write("Available commands:\n")
@@ -104,7 +113,7 @@ class BlogIt:
             self.current_post = None
             vim.current.buffer[0] = "ID\tDate             \tTitle"
             for p in allposts:
-                vim.current.buffer.append(formatter % (int(p['postid']), p['dateCreated'], p['title'].encode('utf-8')))
+                vim.current.buffer.append(formatter % (int(p['postid']), p['date_created_gmt'], p['title'].encode('utf-8')))
                 vim.command('set nomodified')
             vim.current.window.cursor = (2, 0)
             vim.command('map <enter> :py blogit.list_edit()<cr>')
@@ -136,7 +145,7 @@ class BlogIt:
                            'title': '',
                            'categories': '',
                            'mt_keywords': '',
-                           'dateCreated': '',
+                           'date_created_gmt': '',
                            'description': '',
                            'post_status': 'draft',
                            })
@@ -148,8 +157,9 @@ class BlogIt:
         vim.current.buffer.append('Post-Id: %s' % post['postid'])
         vim.current.buffer.append('Subject: %s' % post['title'].encode('utf-8'))
         vim.current.buffer.append('Categories: %s' % ",".join(post["categories"]).encode("utf-8"))
-        vim.current.buffer.append('Tags: %s' % post["mt_keywords"].encode("utf-8"))
-        vim.current.buffer.append('Date: %s' % post['dateCreated'])
+        if self.haveTags:
+            vim.current.buffer.append('Tags: %s' % post["mt_keywords"].encode("utf-8"))
+        vim.current.buffer.append('Date: %s' % post['date_created_gmt'])
         vim.current.buffer.append('')
         content = post["description"].encode("utf-8")
         for line in content.split('\n'):
@@ -205,6 +215,9 @@ class BlogIt:
             return
         self.sendArticle(push=0)
 
+    def nowstr(self):
+        return time.strftime('%Y%m%dT%H:%M:%S', time.localtime(time.mktime(datetime.datetime.utcnow().timetuple())))
+
     def sendArticle(self, push=0):
         try:
             vim.command('set nomodified')
@@ -218,14 +231,16 @@ class BlogIt:
             post['title'] = self.getMeta('Subject')
             post['wp_author_display_name'] = self.getMeta('From')
             post['categories'] = self.getMeta('Categories').split(',')
-            post['mt_keywords'] = self.getMeta('Tags')
+            if self.haveTags:
+                post['mt_keywords'] = self.getMeta('Tags')
             post['description'] = '\n'.join(vim.current.buffer[start_text:])
 
             datetime = self.getMeta('Date')
-            if datetime == '':
-                post['dateCreated'] = DateTime()
+            if datetime != '' and (self.current_post['post_status'] != 'draft' or \
+                                   DateTime(datetime) > DateTime(self.nowstr())):
+                post['date_created_gmt'] = DateTime(datetime)
             else:
-                post['dateCreated'] = DateTime(datetime)
+                post['date_created_gmt'] = DateTime(self.nowstr())
 
             if push:
                 post['post_status'] = 'publish'
@@ -237,12 +252,11 @@ class BlogIt:
             if strid == '':
                 strid = self.client.metaWeblog.newPost('', blog_username,
                                                        blog_password, post, push)
-
-                vim.current.buffer[self.getLine('Post-Id')] = "Post-Id: %s" % strid
-                vim.current.buffer[self.getLine('Date')] = "Date: %s" % post['dateCreated']
             else:
                 self.client.metaWeblog.editPost(strid, blog_username,
                                                 blog_password, post, push)
+
+            self.display_post(self.client.metaWeblog.getPost(strid, blog_username, blog_password))
         except Fault, e:
             sys.stderr.write(e.faultString)
 
