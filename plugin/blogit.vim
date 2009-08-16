@@ -17,8 +17,8 @@
 " Maintainer:   Romain Bignon
 " Contributor:  Adam Schmalhofer
 " URL:          http://symlink.me/wiki/blogit
-" Version:      1.2
-" Last Change:  2009 July 18
+" Version:      1.3
+" Last Change:  2009 August 16
 "
 " Commands :
 " ":Blogit ls"
@@ -39,8 +39,15 @@
 "   Remove an article
 " ":Blogit tags"
 "   Show tags and categories list
+" ":Blogit preview"
+"   Preview current post locally
 " ":Blogit help"
 "   Display help
+"
+" Note that preview might not word on all platforms. This is because we have
+" to rely on unsupported and non-portable functionality from the python
+" standard library.
+"
 "
 " Configuration :
 "   Create a file called passwords.vim somewhere in your 'runtimepath'
@@ -96,7 +103,7 @@ command! -nargs=* Blogit exec('py blogit.command(<f-args>)')
 let s:used_categories = []
 let s:used_tags = []
 
-function BlogitCompleteCategories(findstart, base)
+function BlogitComplete(findstart, base)
     " based on code from :he complete-functions
     if a:findstart
         " locate the start of the word
@@ -107,49 +114,68 @@ function BlogitCompleteCategories(findstart, base)
         endwhile
         return start
     else
-        if getline('.') =~? '^Categories: '
+        let sep = ', '
+        if getline('.') =~# '^Categories: '
             let L = s:used_categories
-        elseif getline('.') =~? '^Tags: '
+        elseif getline('.') =~# '^Tags: '
             let L = s:used_tags
+        elseif getline('.') =~# '^Status: '
+            " for comments
+            let L = [ 'approve', 'spam', 'hold', 'new', 'rm' ]
+            let sep = ''
         else
             return []
         endif
 	    let res = []
 	    for m in L
 	        if m =~ '^' . a:base
-		        call add(res, m . ', ')
+		        call add(res, m . sep)
 	        endif
 	    endfor
 	    return res
     endif
 endfunction
 
+function CommentsFoldText()
+    let line_no = v:foldstart
+    if v:foldlevel > 1
+        while getline(line_no) !~ '^\s*$'
+            let line_no += 1
+        endwhile
+    endif
+    return '+' . v:folddashes . getline(line_no + 1)
+endfunction
+
 python <<EOF
 # -*- coding: utf-8 -*-
 # Lets the python unit test ignore eveything above this line (docstring). """
-try:
-    import vim
-except ImportError:
-    # Used outside of vim (for testing)
-    from minimock import Mock
-    vim = Mock('vim')
-    import doctest
-else:
-    doctest = False
 import xmlrpclib, sys, re
 from time import mktime, strptime, strftime, localtime, gmtime
 from calendar import timegm
 from subprocess import Popen, CalledProcessError, PIPE
 from xmlrpclib import DateTime, Fault, MultiCall
 from inspect import getargspec
-from types import MethodType
+import webbrowser, tempfile
+
+try:
+    import vim
+except ImportError:
+    # Used outside of vim (for testing)
+    from minimock import Mock, mock
+    import minimock, doctest
+    from mock_vim import vim
+else:
+    doctest = False
 
 #####################
 # Do not edit below #
 #####################
 
-class BlogIt:
-    class FilterException(Exception):
+class BlogIt(object):
+    class BlogItException(Exception):
+        pass
+
+    class FilterException(BlogItException):
         def __init__(self, message, input_text, filter):
             self.message = "Blogit: Error happend while filtering with:" + \
                     filter + '\n' + message
@@ -158,50 +184,118 @@ class BlogIt:
 
     def __init__(self):
         self.client = None
-        self.post = {}
+        self._posts = {}
+        self.prev_file = None
 
     def connect(self):
         self.client = xmlrpclib.ServerProxy(self.blog_url)
 
-    def get_current_post(self):
+    def _get_current_data(self, page_type):
         try:
-            return self.post[vim.current.buffer.number]
+            t, data = self._posts[vim.current.buffer.number]
         except KeyError:
             return None
+        else:
+            if t != page_type:
+                raise self.BlogItException(
+                        'This buffer stores "%s" not "%s".' % ( t, page_type ))
+            return data
 
-    def set_current_post(self, value):
-        self.post[vim.current.buffer.number] = value
+    def _set_current_data(self, page_type, value):
+        """
+        >>> vim.current.buffer.change_buffer(3)
+        >>> blogit.current_post = { 'p3': 3 }
+        >>> vim.current.buffer.change_buffer(7)
+        >>> blogit.current_post
+        >>> blogit.current_post = { 'p7': 42 }
+        >>> vim.current.buffer.change_buffer(3)
+        >>> blogit.current_comments    #doctest: +ELLIPSIS
+        Traceback (most recent call last):
+        ...
+        BlogItException: This buffer stores "post" not "comments".
+        >>> blogit.current_post
+        {'p3': 3}
+        """
+        self._posts[vim.current.buffer.number] = ( page_type, value )
 
-    current_post = property(get_current_post, set_current_post)
+    def _get_current_post(self):
+        return self._get_current_data('post')
+
+    def _set_current_post(self, value):
+        return self._set_current_data('post', value)
+
+    def _get_current_comments(self):
+        return self._get_current_data('comments')
+
+    def _set_current_comments(self, value):
+        return self._set_current_data('comments', value)
+
+    @property
+    def current_post_type(self):
+        try:
+            t, data = self._posts[vim.current.buffer.number]
+        except KeyError:
+            return None
+        return t
+
+    current_post = property(_get_current_post, _set_current_post)
+    current_comments = property(_get_current_comments, _set_current_comments)
+
+    meta_data_dict = { 'From': 'wp_author_display_name', 'Post-Id': 'postid',
+            'Subject': 'title', 'Categories': 'categories',
+            'Tags': 'mt_keywords', 'Date': 'date_created_gmt',
+            'Status': 'blogit_status',
+           }
+
+    comments_meta_data_dict = { 'Status': 'status', 'Author': 'author',
+            'ID': 'comment_id', 'Parent': 'parent',
+            'Date': 'date_created_gmt', 'Type': 'type', 'content': 'content',
+           }
+
+    vimcommand_help = []
 
     def command(self, command='help', *args):
         """
-        >>> xmlrpclib = Mock('xmlrpclib')
-        >>> sys.stderr = Mock('stderr')
+        >>> mock('xmlrpclib')
+        >>> mock('sys.stderr')
         >>> blogit.command('non-existant')
-        Called vim.eval('blogit_url')
-        Called stderr.write('No such command: non-existant')
+        Called sys.stderr.write('No such command: non-existant.')
 
         >>> def f(x): print 'got %s' % x
         >>> blogit.command_mocktest = f
-        >>> blogit.command('mocktest')
-        Called stderr.write('Command mocktest takes 0 arguments')
+        >>> blogit.command('mo')
+        Called sys.stderr.write('Command mo takes 0 arguments.')
 
-        >>> blogit.command('mocktest', 2)
+        >>> blogit.command('mo', 2)
         got 2
+
+        >>> blogit.command_mockambiguous = f
+        >>> blogit.command('mo')    #doctest: +NORMALIZE_WHITESPACE
+        Called sys.stderr.write('Ambiguious command mo:
+                mockambiguous, mocktest.')
+
+        >>> minimock.restore()
         """
         if self.client is None:
             self.connect()
-        try:
-            getattr(self, 'command_' + command)(*args)
-        except AttributeError:
-            sys.stderr.write("No such command: %s" % command)
-        except TypeError, e:
+        def f(x): return x.startswith('command_' + command)
+        matching_commands = filter(f, dir(self))
+
+        if len(matching_commands) == 0:
+            sys.stderr.write("No such command: %s." % command)
+        elif len(matching_commands) == 1:
             try:
-                sys.stderr.write("Command %s takes %s arguments" % \
-                        (command, int(str(e).split(' ')[3]) - 1))
-            except:
-                sys.stderr.write('%s' % e)
+                getattr(self, matching_commands[0])(*args)
+            except TypeError, e:
+                try:
+                    sys.stderr.write("Command %s takes %s arguments." % \
+                            (command, int(str(e).split(' ')[3]) - 1))
+                except:
+                    sys.stderr.write('%s' % e)
+        else:
+            sys.stderr.write("Ambiguious command %s: %s." % ( command,
+                    ', '.join([ s.replace('command_', '', 1)
+                        for s in matching_commands ]) ))
 
     def list_comments(self):
         if vim.current.line.startswith('Status: '):
@@ -209,18 +303,20 @@ class BlogIt:
 
     def list_edit(self):
         """
-        >>> vim.command = Mock('vim.command')
+        >>> mock('vim.command')
         >>> vim.current.window.cursor = (1, 2)
-        >>> vim.current.buffer = [ '12 random text' ]
+        >>> vim.current.buffer[:] = [ '12 random text' ]
         >>> blogit.list_edit()
         Called vim.command('bdelete')
         Called vim.command('Blogit edit 12')
 
-        >>> vim.current.buffer = [ 'no blog id 12' ]
-        >>> blogit.command_new = Mock('self.command_new')
+        >>> vim.current.buffer[:] = [ 'no blog id 12' ]
+        >>> mock('blogit.command_new')
         >>> blogit.list_edit()
         Called vim.command('bdelete')
-        Called self.command_new()
+        Called blogit.command_new()
+
+        >>> minimock.restore()
         """
         row, col = vim.current.window.cursor
         id = vim.current.buffer[row-1].split()[0]
@@ -235,17 +331,60 @@ class BlogIt:
             # via command_edit
             vim.command('Blogit edit %s' % id)
 
-    meta_data_dict = { 'From': 'wp_author_display_name', 'Post-Id': 'postid',
-            'Subject': 'title', 'Categories': 'categories',
-            'Tags': 'mt_keywords', 'Date': 'date_created_gmt',
-            'Status': 'blogit_status',
-           }
+    def format_header(self, post_data, label,
+            meta_data_dict, meta_data_f_dict={}):
+        """
+        Returns a header line formated as it will be displayed to the user.
+        """
+        try:
+            val = post_data[meta_data_dict[label]]
+        except KeyError:
+            val = ''
+        if label in meta_data_f_dict:
+            val = meta_data_f_dict[label](val)
+        return '%s: %s' % ( label, unicode(val).encode('utf-8') )
+
+    def format_body(self, post_data, post_body,
+            meta_data_dict, meta_data_f_dict={}, unformat=False):
+        """
+        Yields the lines of a post body.
+        """
+        content = post_data.get(post_body, '').encode('utf-8')
+        if unformat:
+            content = self.unformat(content)
+        for line in content.split('\n'):
+            # not splitlines to preserve \r\n in comments.
+            yield line
+
+        if post_data.get('mt_text_more'):
+            yield ''
+            yield '<!--more-->'
+            yield ''
+            content = self.unformat(post_data["mt_text_more"].encode("utf-8"))
+            for line in content.split('\n'):
+                # not splitlines to preserve \r\n in comments.
+                yield line.encode('utf-8')
+
+    def append_post(self, post_data, post_body, headers,
+            meta_data_dict, meta_data_f_dict={}, unformat=False):
+        """
+        Append a post or comment to the vim buffer.
+        """
+        post = ([ self.format_header(post_data, label,
+                    meta_data_dict, meta_data_f_dict) for label in headers ] +
+                [ '' ] +
+                list( self.format_body(post_data, post_body, meta_data_dict,
+                        meta_data_f_dict, unformat))  )
+        if vim.current.buffer[:] != ['']:
+            # work around empty buffer has one line.
+            vim.current.buffer.append('')
+        vim.current.buffer[-1:] = post
 
     def display_post(self, post={}, new_text=None):
         def display_comment_count(d):
             if d == '':
                 return u'new'
-            comment_typ_count = [ '%s %s' % (key, text)
+            comment_typ_count = [ '%s %s' % (d[key], text)
                     for key, text in ( ( 'awaiting_moderation', 'awaiting' ),
                             ( 'spam', 'spam' ) )
                     if d[key] > 0 ]
@@ -255,49 +394,29 @@ class BlogIt:
                 s = u' (%s)' % ', '.join(comment_typ_count)
             return ( u'%(post_status)s \u2013 %(total_comments)s Comments' + s ) % d
 
+        do_unformat = True
         default_post = { 'post_status': 'draft',
                          self.meta_data_dict['From']: self.blog_username }
         default_post.update(post)
         post = default_post
+        self.current_post = post
         meta_data_f_dict = { 'Date': self.DateTime_to_str,
                    'Categories': lambda L: ', '.join(L),
                    'Status': display_comment_count
                  }
         vim.current.buffer[:] = None
-        vim.command("setlocal ft=mail completefunc=BlogitCompleteCategories")
-        for label in [ 'From', 'Post-Id', 'Subject', 'Status', 'Categories',
-                'Tags', 'Date' ]:
-            try:
-                val = post[self.meta_data_dict[label]]
-            except KeyError:
-                val = ''
-            if label in meta_data_f_dict:
-                val = meta_data_f_dict[label](val)
-            vim.current.buffer.append('%s: %s' % ( label,
-                    unicode(val).encode('utf-8') ))
-        vim.current.buffer[0] = None
-        vim.current.buffer.append('')
-        if new_text is None:
-            content = self.unformat(post.get('description', '')\
-                        .encode("utf-8")).split('\n')
-        else:
-            content = new_text
-        for line in content:
-            vim.current.buffer.append(line)
-
-        if post.get('mt_text_more'):
-            vim.current.buffer.append('')
-            vim.current.buffer.append('<!--more-->')
-            vim.current.buffer.append('')
-            content = self.unformat(post["mt_text_more"].encode("utf-8"))
-            for line in content.split('\n'):
-                vim.current.buffer.append(line)
-
-        vim.current.window.cursor = (8, 0)
-        vim.command('set nomodified')
-        vim.command('set textwidth=0')
+        if new_text is not None:
+            post['description'] = new_text
+            do_unformat = False
+        self.append_post(post, 'description',
+                [ 'From', 'Post-Id', 'Subject', 'Status', 'Categories',
+                    'Tags', 'Date'
+                ], self.meta_data_dict, meta_data_f_dict, do_unformat)
         self.current_post = post
         vim.command('nnoremap <buffer> gf :py blogit.list_comments()<cr>')
+        vim.command('setlocal nomodified ft=mail textwidth=0 ' +
+                             'completefunc=BlogitComplete')
+        vim.current.window.cursor = (8, 0)
 
     @staticmethod
     def str_to_DateTime(text='', format='%c'):
@@ -337,17 +456,21 @@ class BlogIt:
 
     def getPost(self, id):
         """
-        >>> blogit.blog_username, blogit.blog_password = 'user', 'password'
-        >>> xmlrpclib.MultiCall = Mock('xmlrpclib.MultiCall', returns=Mock(
+        >>> mock('xmlrpclib.MultiCall', returns=Mock(
         ...         'multicall', returns=[{'post_status': 'draft'}, {}]))
-        >>> d = blogit.getPost(42)    #doctest: +ELLIPSIS
-        Called xmlrpclib.MultiCall(<Mock 0x... client>)
+        >>> mock('vim.mocked_eval')
+
+        >>> d = blogit.getPost(42)
+        Called xmlrpclib.MultiCall(<ServerProxy for example.com/RPC2>)
         Called multicall.metaWeblog.getPost(42, 'user', 'password')
         Called multicall.wp.getCommentCount('', 'user', 'password', 42)
-        Called vim.eval('s:used_tags == [] || s:used_categories == []')
+        Called vim.mocked_eval('s:used_tags == [] || s:used_categories == []')
         Called multicall()
         >>> sorted(d.items())
         [('blogit_status', {'post_status': 'draft'}), ('post_status', 'draft')]
+
+        >>> minimock.restore()
+
         """
         username, password = self.blog_username, self.blog_password
         multicall = xmlrpclib.MultiCall(self.client)
@@ -367,148 +490,299 @@ class BlogIt:
         d['blogit_status'] = comments
         return d
 
-    def getComments(self, id, offset=0):
-        """
-        >>> vim.command = Mock('vim.command')
-        >>> blogit.client = Mock('client')
-        >>> blogit.client.wp.getComments = Mock('getComments', returns=[])
-        >>> blogit.getComments(42)
-        Called vim.command('enew')
-        Called vim.eval('blogit_username')
-        Called vim.eval('blogit_password')
-        Called getComments(
-            '',
-            'http://example.com',
-            'http://example.com',
-            {'post_id': 42, 'number': 1000, 'offset': 0})
-        Called vim.command('set nomodifiable')
-        """
-        # TODO
-        vim.command('enew')
-        for comment in self.client.wp.getComments('', blogit.blog_username,
-                blogit.blog_password, {'post_id': id,
-                                       'offset': offset,
-                                       'number': 1000}):
-            for header in ( 'status', 'author', 'comment_id', 'parent',
-                        'date_created_gmt', 'type'  ):
-                vim.current.buffer.append('%s: %s' %
-                        ( header, comment[header] ))
-            vim.current.buffer.append('')
-            for line in comment['content'].split('\n'):
-                vim.current.buffer.append(line.encode('utf-8'))
-            vim.current.buffer.append('=' * 78)
-            vim.current.buffer.append('')
-        vim.command('set nomodifiable')
+    def getComments(self, id=None, offset=0):
+        """ Lists the comments to a post with given id in a new buffer.
 
-    def getMeta(self):
+        >>> mock('xmlrpclib.MultiCall', returns=Mock(
+        ...         'multicall', returns=[], tracker=None))
+        >>> mock('vim.command')
+        >>> mock('blogit.append_comment_to_buffer')
+        >>> mock('blogit.changed_comments', returns=[])
+        >>> blogit.getComments(42)   #doctest: +NORMALIZE_WHITESPACE
+        Called vim.command('enew')
+        Called xmlrpclib.MultiCall(<ServerProxy for example.com/RPC2>)
+        Called blogit.append_comment_to_buffer()
+        Called vim.command(
+            'setlocal nomodified linebreak
+                      foldmethod=marker foldtext=CommentsFoldText()
+                      completefunc=BlogitComplete')
+        Called blogit.changed_comments()
+
+        >>> minimock.restore()
         """
-        >>> vim.current.buffer = [ 'tag: value', '', 'body: novalue' ]
-        >>> list(blogit.getMeta())
-        [('tag', 'value')]
+        if id is None:
+            id = self.current_comments['blog_id']
+            vim.current.buffer[:] = None
+        else:
+            vim.command('enew')
+        self.current_comments = { 'blog_id': id }
+        multicall = xmlrpclib.MultiCall(self.client)
+        for comment_typ in ( 'hold', 'spam', 'approve' ):
+            multicall.wp.getComments('',
+                    self.blog_username, self.blog_password,
+                    { 'post_id': id, 'status': comment_typ,
+                      'offset': offset, 'number': 1000 })
+        self.append_comment_to_buffer()
+        for comments, heading in zip(multicall(),
+                ( 'In Moderadation', 'Spam', 'Published' )):
+            if comments == []:
+                continue
+
+            vim.current.buffer[-1] = 72 * '=' + ' {{{1'
+            vim.current.buffer.append(5 * ' ' + heading)
+            vim.current.buffer.append('')
+
+            fold_levels = {}
+            for comment in reversed(comments):
+                try:
+                    fold = fold_levels[comment['parent']] + 2
+                except KeyError:
+                    fold = 2
+                fold_levels[comment['post_id']] = fold
+                self.append_comment_to_buffer(comment, fold)
+        vim.command('setlocal nomodified linebreak ' +
+            'foldmethod=marker foldtext=CommentsFoldText() ' +
+            'completefunc=BlogitComplete')
+        if type(self.current_comments['blog_id']) == dict:
+            # no comment should have id 'blog_id'.
+            sys.stderr.write('A comment used reserved id "blog_id"')
+        elif list(self.changed_comments()) != []:
+            sys.stderr.write('Bug in BlogIt: Deactivating comment editing:\n')
+            for d in self.changed_comments():
+                sys.stderr.write('  %s' % d['comment_id'])
+                #print list(self.changed_comments())
+        else:
+            return
+        vim.command('setlocal nomodifiable')
+        self.current_comments = None
+
+    def changed_comments(self):
+        """ Yields comments with changes made to in the vim buffer.
+
+        >>> blogit.current_comments = { '': { 'status': 'new'},
+        ...     '1': { 'content': 'Old Text', 'status': 'hold',
+        ...             'unknown': 'tag'},
+        ...     '2': { 'content': 'Same Text', 'Date': 'old', 'status': 'hold'},
+        ...     '3': { 'content': 'Same Again', 'status': 'hold'} }
+        >>> vim.current.buffer[:] = [
+        ...     60 * '=', 'ID: 1 ', 'Status: hold', '', 'Changed Text',
+        ...     60 * '=', 'ID:  ', 'Status: hold', '', 'New Text',
+        ...     60 * '=', 'ID: 2', 'Status: hold', 'Date: new', '', 'Same Text',
+        ...     60 * '=', 'ID: 3', 'Status: spam', '', 'Same Again',
+        ... ]
+        >>> list(blogit.changed_comments())    #doctest: +NORMALIZE_WHITESPACE
+        [{'content': u'Changed Text', 'status': u'hold', 'unknown': 'tag'},
+         {'status': u'hold', 'content': u'New Text'},
+         {'content': u'Same Again', 'status': u'spam'}]
+        """
+        ignored_tags = set([ 'ID', 'Date' ])
+
+        for comment in self.read_comments():
+            original_comment = self.current_comments[comment['ID']]
+            updated_comment = original_comment.copy()
+            for t in comment.keys():
+                if t in ignored_tags:
+                    continue
+                updated_comment[self.comments_meta_data_dict[t]] = \
+                        comment[t].decode('utf-8')
+            if original_comment != updated_comment:
+                yield updated_comment
+
+    def read_comments(self):
+        r""" Yields a dict for each comment in the current buffer.
+
+        >>> vim.current.buffer[:] = [
+        ...     60 * '=', 'section header',
+        ...     60 * '=', 'Tag2: Val2 ',
+        ...     60 * '=',
+        ...     'Tag:  Value  ', '', 'Some Text', 'in two lines.', '', '',
+        ... ]
+        >>> list(blogit.read_comments())
+        [{'content': 'Some Text\nin two lines.', 'Tag': 'Value'}]
+        """
+
+        def process_comment(headers, body):
+            body = '\n'.join(body).strip()
+            if body == '':
+                return None
+            d = { 'content': body }
+            for t, v in map(self.getMeta, headers):
+                d[t.strip()] = v.strip()
+            return d
+
+        headers = []
+        body = []
+        current_section = headers
+        for line in vim.current.buffer:
+            if line.startswith(60 * '='):
+                c = process_comment(headers, body)
+                headers, body = [], []
+                current_section = headers
+                if c is not None:
+                    yield c
+                continue
+            if current_section == headers and line.strip() == '':
+                current_section = body
+                continue
+            current_section.append(line)
+        c = process_comment(headers, body)
+        if c is not None:
+            yield c
+
+    def append_comment_to_buffer(self, comment=None, fold_level=1):
+        """
+        Formats and appends a given comment to the current buffer. Appends
+        an comment template if None is given.
+
+        >>> vim.current.buffer[:] = ['']
+        >>> blogit.current_comments = { 'blog_id': 0 }
+        >>> blogit.append_comment_to_buffer()
+        >>> vim.current.buffer   #doctest: +NORMALIZE_WHITESPACE
+        ['======================================================================== {{{1',
+        'Status: new',
+        'Author: user',
+        'ID: ',
+        'Parent: 0',
+        'Date: ',
+        'Type: ',
+        '',
+        '',
+        '',
+        '']
+        """
+        meta_data_f_dict = { 'Date': self.DateTime_to_str }
+        if comment is None:
+            comment = { 'status': 'new', 'author': self.blog_username,
+                        'comment_id': '', 'parent': '0',
+                        'date_created_gmt': '', 'type': '', 'content': ''
+                      }
+        vim.current.buffer[-1] = 72 * '=' + ' {{{%s' % fold_level
+        self.append_post(comment, 'content', [ 'Status', 'Author',
+                'ID', 'Parent', 'Date', 'Type' ],
+                self.comments_meta_data_dict, meta_data_f_dict)
+        vim.current.buffer.append('')
+        vim.current.buffer.append('')
+        vim.current.buffer.append('')
+        self.current_comments[str(comment['comment_id'])] = comment
+
+    def getMeta(self, line):
+        """
+        Reads the meta-data in the current buffer. Outputed as dictionary.
+
+        >>> blogit.getMeta('tag: value')
+        ('tag', 'value')
         """
         r = re.compile('^(.*?): (.*)$')
-        for line in vim.current.buffer:
-            if line.rstrip() == '':
-                return
-            m = r.match(line)
-            if m:
-                yield m.group(1, 2)
+        m = r.match(line)
+        return m.group(1, 2)
 
-    def getText(self, start_text):
+    def getText(self, lines):
         r"""
+        Read the blog text from vim buffer. start_line is the first
+        line which is part of the test (not headers). Text is then formated
+        as defined by vim variable blogit_format.
 
         Can raise FilterException.
 
-        >>> vim.current.buffer = [ 'one', 'two', 'tree', 'four' ]
+        >>> mock('vim.mocked_eval')
 
-        >>> blogit.getText(0)
-        Called vim.eval('exists("blogit_format")')
+        >>> blogit.getText([ 'one', 'two', 'tree', 'four' ])
+        Called vim.mocked_eval("exists('blogit_format')")
+        Called vim.mocked_eval("exists('blogit_postsource')")
         ['one\ntwo\ntree\nfour']
 
-        >>> blogit.getText(1)
-        Called vim.eval('exists("blogit_format")')
-        ['two\ntree\nfour']
-
-        >>> blogit.getText(4)
-        Called vim.eval('exists("blogit_format")')
-        ['']
-
-        >>> vim.eval = Mock('vim.eval', returns_iter=['1', 'sort'])
-        >>> blogit.getText(0)
-        Called vim.eval('exists("blogit_format")')
-        Called vim.eval('blogit_format')
+        >>> mock('vim.mocked_eval', returns_iter=['1', 'sort', '0'])
+        >>> blogit.getText([ 'one', 'two', 'tree', 'four' ])
+        Called vim.mocked_eval("exists('blogit_format')")
+        Called vim.mocked_eval('blogit_format')
+        Called vim.mocked_eval("exists('blogit_postsource')")
         ['four\none\ntree\ntwo\n']
 
-        >>> vim.eval = Mock('vim.eval', returns_iter=['1', 'false'])
-        >>> blogit.getText(0)     # can't get this to work :'(
+        >>> mock('vim.mocked_eval', returns_iter=['1', 'false'])
+        >>> blogit.getText([ 'one', 'two', 'tree', 'four' ])
         Traceback (most recent call last):
             ...
         FilterException
+
+        >>> minimock.restore()
         """
-        text = '\n'.join(vim.current.buffer[start_text:])
+        text = '\n'.join(lines)
         return map(self.format, text.split('\n<!--more-->\n\n'))
 
     def unformat(self, text):
         r"""
-        >>> old = vim.eval
-        >>> vim.eval = Mock('vim.eval', returns_iter=[ '1', 'false' ])
+        >>> mock('vim.mocked_eval', returns_iter=[ '1', 'false' ])
+        >>> mock('sys.stderr')
         >>> blogit.unformat('some random text')
         ...         #doctest: +NORMALIZE_WHITESPACE
-        Called vim.eval('exists("blogit_unformat")')
-        Called vim.eval('blogit_unformat')
-        Called stderr.write('Blogit: Error happend while filtering
+        Called vim.mocked_eval("exists('blogit_unformat')")
+        Called vim.mocked_eval('blogit_unformat')
+        Called sys.stderr.write('Blogit: Error happend while filtering
                 with:false\n')
         'some random text'
 
-        >>> vim.eval = old
+        >>> blogit.unformat('''\n\n
+        ...         \n <!--blogit-- Post Source --blogit--> <h1>HTML</h1>''')
+        'Post Source'
+
+        >>> minimock.restore()
         """
+        if text.lstrip().startswith('<!--blogit-- '):
+            return ( text.replace('<!--blogit--', '', 1).
+                    split(' --blogit-->', 1)[0].strip() )
         try:
-            return self.format(text, 'blogit_unformat')
+            return self.filter(text, 'unformat')
         except self.FilterException, e:
             sys.stderr.write(e.message)
             return e.input_text
 
-    def format(self, text, vim_var='blogit_format'):
+    def format(self, text):
+        formated = self.filter(text, 'format')
+        if self.blog_postsource:
+            formated = "<!--blogit--\n%s\n--blogit-->\n%s" % ( text, formated )
+        return formated
+
+    def filter(self, text, vim_var='format'):
         r""" Filter text with command in vim_var.
 
         Can raise FilterException.
 
-        >>> blogit.format('some random text')
-        Called vim.eval('exists("blogit_format")')
+        >>> mock('vim.mocked_eval')
+        >>> blogit.filter('some random text')
+        Called vim.mocked_eval("exists('blogit_format')")
         'some random text'
 
-        >>> old = vim.eval
-        >>> vim.eval = Mock('vim.eval', returns_iter=[ '1', 'false' ])
-        >>> blogit.format('some random text')
+        >>> mock('vim.mocked_eval', returns_iter=[ '1', 'false' ])
+        >>> blogit.filter('some random text')
         Traceback (most recent call last):
             ...
         FilterException
 
-        >>> vim.eval = Mock('vim.eval', returns_iter=[ '1', 'rev' ])
-        >>> blogit.format('')
-        Called vim.eval('exists("blogit_format")')
-        Called vim.eval('blogit_format')
+        >>> mock('vim.mocked_eval', returns_iter=[ '1', 'rev' ])
+        >>> blogit.filter('')
+        Called vim.mocked_eval("exists('blogit_format')")
+        Called vim.mocked_eval('blogit_format')
         ''
 
-        >>> vim.eval = Mock('vim.eval', returns_iter=[ '1', 'rev' ])
-        >>> blogit.format('some random text')
-        Called vim.eval('exists("blogit_format")')
-        Called vim.eval('blogit_format')
+        >>> mock('vim.mocked_eval', returns_iter=[ '1', 'rev' ])
+        >>> blogit.filter('some random text')
+        Called vim.mocked_eval("exists('blogit_format')")
+        Called vim.mocked_eval('blogit_format')
         'txet modnar emos\n'
 
-        >>> vim.eval = Mock('vim.eval', returns_iter=[ '1', 'rev' ])
-        >>> blogit.format('some random text\nwith a second line')
-        Called vim.eval('exists("blogit_format")')
-        Called vim.eval('blogit_format')
+        >>> mock('vim.mocked_eval', returns_iter=[ '1', 'rev' ])
+        >>> blogit.filter('some random text\nwith a second line')
+        Called vim.mocked_eval("exists('blogit_format')")
+        Called vim.mocked_eval('blogit_format')
         'txet modnar emos\nenil dnoces a htiw\n'
 
-        >>> vim.eval = old
+        >>> minimock.restore()
 
         """
-        if not vim.eval('exists("%s")' % vim_var) == '1':
+        filter = self.vim_variable(vim_var)
+        if filter is None:
             return text
         try:
-            filter = vim.eval(vim_var)
             p = Popen(filter, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE)
             p.stdin.write(text)
             p.stdin.close()
@@ -539,92 +813,159 @@ class BlogIt:
 
         def split_comma(x): return x.split(', ')
 
-        if self.current_post is None:
+        if self.current_post_type is not 'post':
             sys.stderr.write("Not editing a post.")
             return
-        try:
-            vim.command('set nomodified')
-            start_text = 0
-            for line in vim.current.buffer:
+        vim.command('set nomodified')
+
+        post = self.current_post.copy()
+        meta_data_f_dict = { 'Categories': split_comma,
+                             'Date': date_from_meta }
+        push_dict = { 0: 'draft', 1: 'publish',
+                      None: self.current_post['post_status'] }
+        post['post_status'] = push_dict[push]
+        for start_text, line in enumerate(vim.current.buffer):
+            if line == '':
                 start_text += 1
-                if line == '':
-                    break
-
-            post = self.current_post.copy()
-            meta_data_f_dict = { 'Categories': split_comma,
-                                 'Date': date_from_meta }
-
-            for label, value in self.getMeta():
-                if self.meta_data_dict[label].startswith('blogit_'):
-                    continue
-                if label in meta_data_f_dict:
-                    value = meta_data_f_dict[label](value)
-                post[self.meta_data_dict[label]] = value
-
-            push_dict = { 0: 'draft', 1: 'publish',
-                          None: self.current_post['post_status'] }
-            post['post_status'] = push_dict[push]
-            if push is None:
-                push = 0
-
-            textl = self.getText(start_text)
+                break
+            label, value = self.getMeta(line)
+            if self.meta_data_dict[label].startswith('blogit_'):
+                continue
+            if label in meta_data_f_dict:
+                value = meta_data_f_dict[label](value)
+            post[self.meta_data_dict[label]] = value
+        if push is None:
+            push = 0
+        try:
+            textl = self.getText(vim.current.buffer[start_text:])
+        except self.FilterException, e:
+            sys.stderr.write(e.message)
+        else:
             post['description'] = textl[0]
             if len(textl) > 1:
                 post['mt_text_more'] = textl[1]
-
+        try:
             postid = sendPost(post['postid'], post, push)
-            self.display_post(self.getPost(postid))
-        except self.FilterException, e:
-            sys.stderr.write(e.message)
         except Fault, e:
             sys.stderr.write(e.faultString)
+        else:
+            self.display_post(self.getPost(postid))
+
+    def sendComments(self):
+        """ Send changed and new comments to server.
+
+        >>> blogit.current_comment = { 'blog_id': 42 }
+        >>> mock('sys.stderr')
+        >>> mock('blogit.getComments')
+        >>> mock('blogit.changed_comments',
+        ...         returns=[ { 'status': 'new', 'content': 'New Text' },
+        ...             { 'status': 'will fail', 'comment_id': 13 },
+        ...             { 'status': 'will succeed', 'comment_id': 7 },
+        ...             { 'status': 'rm', 'comment_id': 100 } ])
+        >>> mock('xmlrpclib.MultiCall', returns=Mock(
+        ...         'multicall', returns=[ 200, False, True, True ]))
+        >>> blogit.sendComments()    #doctest: +NORMALIZE_WHITESPACE
+        Called xmlrpclib.MultiCall(<ServerProxy for example.com/RPC2>)
+        Called blogit.changed_comments()
+        Called multicall.wp.newComment(
+            '', 'user', 'password', 42,
+            {'status': 'approve', 'content': 'New Text'})
+        Called multicall.wp.editComment(
+            '', 'user', 'password', 13, {'status': 'will fail'})
+        Called multicall.wp.editComment(
+            '', 'user', 'password', 7, {'status': 'will succeed'})
+        Called multicall.wp.deleteComment('', 'user', 'password', 100)
+        Called multicall()
+        Called sys.stderr.write('Server refuses update to 13.')
+        Called blogit.getComments()
+
+        >>> minimock.restore()
+
+        """
+        multicall = xmlrpclib.MultiCall(self.client)
+        username, password = self.blog_username, self.blog_password
+        blog_id = self.current_comments['blog_id']
+        multicall_log = []
+        for comment in self.changed_comments():
+            if comment['status'] == 'new':
+                comment['status'] = 'approve'
+                multicall.wp.newComment(
+                        '', username, password, blog_id, comment)
+                multicall_log.append('new')
+            elif comment['status'] == 'rm':
+                multicall.wp.deleteComment(
+                        '', username, password, comment['comment_id'])
+            else:
+                comment_id = comment['comment_id']
+                del comment['comment_id']
+                multicall.wp.editComment(
+                        '', username, password, comment_id, comment)
+                multicall_log.append(comment_id)
+        for accepted, comment_id in zip(multicall(), multicall_log):
+            if comment_id != 'new' and not accepted:
+                sys.stderr.write('Server refuses update to %s.' % comment_id)
+        self.getComments()
 
     @property
     def blog_username(self):
-        return vim.eval(self.blog_name + '_username')
+        return self.vim_variable('username')
 
     @property
     def blog_password(self):
-        return vim.eval(self.blog_name + '_password')
+        return self.vim_variable('password')
 
     @property
     def blog_url(self):
         """
-        >>> vim.eval.mock_returns = 'http://example.com'
-        >>> blogit.blog_name='blogit'
+        >>> mock('vim.eval',
+        ...      returns_iter=[ '0', '0', '1', 'http://example.com/' ])
         >>> blogit.blog_url
+        Called vim.eval("exists('b:blog_name')")
+        Called vim.eval("exists('blog_name')")
+        Called vim.eval("exists('blogit_url')")
         Called vim.eval('blogit_url')
-        'http://example.com'
+        'http://example.com/'
+        >>> minimock.restore()
         """
-        return vim.eval(self.blog_name + '_url')
+        return self.vim_variable('url')
+
+    @property
+    def blog_postsource(self):
+        """ Bool: Include the unformated version of a post in an html comment.
+
+        If the program only converts to html, you can have blogit save the
+        "source" in an html comment (Warning: This doesn't work reliably with
+        Wordpress. Use at your own risk).
+
+            let blogit_postsource=1
+        """
+        return self.vim_variable('postsource') == '1'
 
     @property
     def blog_name(self):
-        """
-        >>> vim.eval = Mock('vim.eval')
-        >>> blogit.blog_name
-        Called vim.eval("exists('b:blog_name')")
-        Called vim.eval("exists('blog_name')")
-        'blogit'
+        for var_name in ( 'b:blog_name', 'blog_name' ):
+            var_value = self.vim_variable(var_name, prefix=False)
+            if var_value is not None:
+                return var_value
+        return 'blogit'
 
-        """
-        if vim.eval("exists('b:blog_name')") == '1':
-            return vim.eval('b:blog_name')
-        elif vim.eval("exists('blog_name')") == '1':
-            return vim.eval('blog_name')
+    def vim_variable(self, var_name, prefix=True):
+        """ Simplefy access to vim-variables. """
+        if prefix:
+            var_name = '_'.join(( self.blog_name, var_name ))
+        if vim.eval("exists('%s')" % var_name) == '1':
+            return vim.eval('%s' % var_name)
         else:
-            return 'blogit'
-
-    vimcommand_help = []
+            return None
 
     def vimcommand(f, register_to=vimcommand_help):
         r"""
         >>> class C:
         ...     def command_f(self):
-        ...         ''' A method. '''
+        ...         ' A method. '
         ...         print "f should not be executed."
         ...     def command_g(self, one, two):
-        ...         ''' A method with options. '''
+        ...         ' A method with options. '
         ...         print "g should not be executed."
         ...
         >>> L = []
@@ -702,8 +1043,9 @@ class BlogIt:
     @vimcommand
     def command_this(self):
         """ make this a blog post """
-        if self.current_post is None:
-            self.display_post(new_text=vim.current.buffer[:])
+        if self.current_post_type is None:
+            self.display_post(new_text='\n'.join(
+                [ line for line in vim.current.buffer[:] ]))
         else:
             sys.stderr.write("Already editing a post.")
 
@@ -726,8 +1068,11 @@ class BlogIt:
 
     @vimcommand
     def command_commit(self):
-        """ commit current post """
-        self.sendArticle()
+        """ commit current post or comments """
+        if self.current_post_type == 'comments':
+            self.sendComments()
+        else:
+            self.sendArticle()
 
     @vimcommand
     def command_push(self):
@@ -773,6 +1118,22 @@ class BlogIt:
         vim.command('let s:used_categories = %s' % categories)
         sys.stdout.write('\n \n \nCategories\n==========\n \n' + ', '.join(categories))
         sys.stdout.write('\n \n \nTags\n====\n \n' + ', '.join(tags))
+
+    @vimcommand
+    def command_preview(self):
+        """ preview current post locally """
+        if self.prev_file is None:
+            self.prev_file = tempfile.mkstemp('.html', 'blogit')[1]
+        f = open(self.prev_file, 'w')
+        start_text = 0
+        for line in vim.current.buffer:
+            start_text += 1
+            if line == '':
+                break
+        f.write('<br/>'.join(self.getText(vim.current.buffer[start_text:])))
+        f.flush()
+        f.close()
+        webbrowser.open(self.prev_file)
 
     @vimcommand
     def command_help(self):
