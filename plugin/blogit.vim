@@ -839,6 +839,8 @@ class BlogIt(object):
                             self.vim_vars.blog_password, self.post_data, push)
 
             self.read_post(lines)
+            if push == 1 or push == 0:
+                self.set_server_var__Date_AS_DateTime(DateTime())
             self.post_data.update(self.new_post_data)
             push_dict = { 0: 'draft', 1: 'publish',
                           None: self.post_data['post_status'] }
@@ -934,9 +936,12 @@ class BlogIt(object):
             >>> BlogIt.Page(42).read_header__Id('42 (about)')
             Called BlogIt.BlogPost.set_server_var_default('Page', 'about')
             Called BlogIt.BlogPost.set_server_var_default('Id', '42')
+            >>> BlogIt.Page(42).read_header__Id(' (about)')
+            Called BlogIt.BlogPost.set_server_var_default('Page', 'about')
+            Called BlogIt.BlogPost.set_server_var_default('Id', '')
             >>> minimock.restore()
             """
-            id, page = re.match('(\d+) *\((.*)\)', text).group(1, 2)
+            id, page = re.match('(\d*) *\((.*)\)', text).group(1, 2)
             self.set_server_var__Page(page)
             #super(BlogIt.Page, self).read_header__Id(id)
             BlogIt.BlogPost.read_header_default(self, 'Id', id)
@@ -966,7 +971,8 @@ class BlogIt(object):
                                   'Categories_AS_list': 'categories',
                                   'Date_AS_DateTime': 'dateCreated',
                                   'Status_AS_dict': 'blogit_status',
-                                  'Page': 'wp_slug'
+                                  'Page': 'wp_slug',
+                                  'Status_post': 'page_status',
                                  }
             super(BlogIt.WordPressPage, self
                  ).__init__(blog_post_id, post_data, meta_data_dict,
@@ -975,13 +981,25 @@ class BlogIt(object):
                 client = xmlrpclib.ServerProxy(self.vim_vars.blog_url)
             self.client = client
 
-        def send(self, lines):
+        def send(self, lines, push=None):
             self.read_post(lines)
+            if push == 1:
+                self.set_server_var__Date_AS_DateTime(DateTime())
+                self.set_server_var__Status_post('publish')
+            elif push == 0:
+                self.set_server_var__Date_AS_DateTime(DateTime())
+                self.set_server_var__Status_post('draft')
             self.post_data.update(self.new_post_data)
-            self.client.wp.editPage('', self.BLOG_POST_ID,
-                                    self.vim_vars.blog_username,
-                                    self.vim_vars.blog_password,
-                                    self.post_data)
+            if self.BLOG_POST_ID == '':
+                self.BLOG_POST_ID = self.client.wp.newPage('',
+                                                 self.vim_vars.blog_username,
+                                                 self.vim_vars.blog_password,
+                                                 self.post_data)
+            else:
+                self.client.wp.editPage('', self.BLOG_POST_ID,
+                                        self.vim_vars.blog_username,
+                                        self.vim_vars.blog_password,
+                                        self.post_data)
             self.getPost()
 
         def getPost(self):
@@ -1403,14 +1421,15 @@ class BlogIt(object):
 
         >>> minimock.restore()
         """
-        def f(x): return x.startswith('command_' + command)
-        matching_commands = filter(f, dir(self))
-
         if bang == '!':
             # Workaround limit to access vim s:variables when
             # called via :python.
             getattr(self, command)()
             return
+
+        def f(x): return x.startswith('command_' + command)
+        matching_commands = filter(f, dir(self))
+
         if len(matching_commands) == 0:
             sys.stderr.write("No such command: %s." % command)
         elif len(matching_commands) == 1:
