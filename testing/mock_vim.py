@@ -1,6 +1,10 @@
 #!/usr/bin/env python
+
+import doctest
+
 from minimock import Mock, AbstractTracker
-import minimock, doctest
+import minimock
+
 
 class Mock_Buffer(list):
     number = 3
@@ -33,10 +37,13 @@ class Mock_Buffer(list):
         self._buffers[number] = self
         self.number = number
 
+
 class FailTracker(AbstractTracker):
     """ A Mock Tracker that fails on every call. """
+
     def __init__(self, *args, **kw):
         pass
+
 
 class MockVim(object):
     """ Creates a mock for the vim module.
@@ -49,10 +56,10 @@ class MockVim(object):
     Holds the variables set as well as the buffers. mocked_eval is a hook
     for other calls to eval.
     """
-    DUMMY_VIM_VARS = { 'blog_name': 'blogit',
-                       'blogit_username': 'user',
-                       'blogit_password': 'password',
-                       'blogit_url': 'http://example.com',
+    DUMMY_VIM_VARS = {'blog_name': 'blogit',
+                      'blogit_username': 'user',
+                      'blogit_password': 'password',
+                      'blogit_url': 'http://example.com',
                      }
 
     def __init__(self, vim, vim_vars=None):
@@ -74,6 +81,7 @@ class MockVim(object):
         for var_name in self.vim_vars.keys():
             self.eval_command_dict["exists('%s')" % var_name] = '1'
             self.eval_command_dict["exists('b:%s')" % var_name] = '0'
+
 
 def mock_vim(vim=None, vim_vars=None, vim_buffer=None, **kw):
     """ Factory for MockVim. """
